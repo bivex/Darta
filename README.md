@@ -20,7 +20,7 @@ This creates a symlink at `/usr/local/bin/darta` so you can run `darta` from any
 ## Usage
 
 ```
-python darta.py [--path <dir>] [--format json|html|md] [--output file|stdout]
+python darta.py [--path <dir>] [--format json|html|md] [--output file|stdout] [--component-depth N]
 ```
 
 | Flag | Default | Description |
@@ -28,6 +28,7 @@ python darta.py [--path <dir>] [--format json|html|md] [--output file|stdout]
 | `--path` | `.` (current dir) | Path to Flutter/Dart project root |
 | `--format` | `html` | Output format: `html`, `json`, or `md` |
 | `--output` | `file` | `file` saves `DARTA_REPORT.<ext>` in project root; `stdout` prints to terminal; or provide an explicit file path |
+| `--component-depth` | `auto` | Override how many directory levels under `lib/` define a component |
 
 ### Examples
 
@@ -43,6 +44,9 @@ darta --path ~/projects/my_flutter_app --format json --output stdout
 
 # Markdown report saved to a custom path
 darta --path ~/projects/my_flutter_app --format md --output ~/reports/report.md
+
+# Force component grouping to two levels under lib/
+darta --path ~/projects/my_flutter_app --component-depth 2
 
 # HTML report for CI (write to stdout, redirect to file)
 darta --format html --output stdout > report.html
@@ -68,7 +72,7 @@ Darta walks the `lib/` directory and parses every `.dart` file using regex patte
 | WMC | Weighted Method Count (sum of CC) |
 | DIT | Depth of Inheritance Tree |
 | FANIN | Files that import this file |
-| FANOUT | Files this file imports (internal only) |
+| FANOUT | Files this file references via import/export/part (internal only) |
 
 ### Smells Detected
 
@@ -90,7 +94,7 @@ Darta walks the `lib/` directory and parses every `.dart` file using regex patte
 - Hub-like Modularization
 - Multifaceted Abstraction
 
-**Architecture smells** (per component = first-level directory under lib/):
+**Architecture smells** (per inferred component under `lib/`):
 - God Component
 - Dense Structure
 - Unstable Dependency
@@ -101,9 +105,9 @@ Darta walks the `lib/` directory and parses every `.dart` file using regex patte
 ```
 Technical Debt Score =
   God Class × 50 + God Component × 100 + Unstable Dependency × 80 +
-  Dense Structure × 40 + Hub-like × 60 + Insufficient Mod × 30 +
-  Deficient Encap × 20 + Long Method × 5 + Complex Method × 10 +
-  Magic Number × 2
+  Dense Structure × 40 + Feature Concentration × 35 + Hub-like × 60 +
+  Insufficient Mod × 30 + Deficient Encap × 20 + Long Method × 5 +
+  Complex Method × 10 + Magic Number × 2
 
 Health Score = max(0, 100 - TechnicalDebt / 10)
 ```
@@ -157,17 +161,23 @@ Human-readable report suitable for GitHub issues, Confluence, or Notion.
 
 ## How Components Are Defined
 
-A **component** is the first subdirectory under `lib/`:
+A **component** is inferred from directories under `lib/`:
 - `lib/core/foo.dart` → component `core`
-- `lib/features/auth/login.dart` → component `features`
+- `lib/features/auth/login.dart` → component `features/auth` (auto mode)
 - `lib/main.dart` → component `root`
 
+By default Darta uses:
+- the first directory under `lib/`
+- the first two directories for aggregate folders like `features/*` and `modules/*`
+
+If your project uses a different convention, pass `--component-depth N`.
+
 Component **stability** = Ce / (Ca + Ce), where:
-- Ce = efferent coupling (cross-component imports made)
-- Ca = afferent coupling (cross-component imports received)
+- Ce = efferent coupling (cross-component dependencies made)
+- Ca = afferent coupling (cross-component dependencies received)
 
 A stability of 1.0 means fully instable (all dependencies go outward).
-A stability of 0.0 means fully stable (only depended upon, never imports).
+A stability of 0.0 means fully stable (only depended upon, never depends outward).
 
 ---
 
@@ -177,6 +187,7 @@ Since Darta uses regex (not a full Dart AST parser):
 - Deeply nested or unusual formatting may cause missed or incorrect detections
 - Generic type parameters in complex positions may not parse perfectly
 - Macro-generated or heavily annotated code may show false positives
-- `part` / `part of` barrel files are counted but not specially handled
+- `export` and `part` links are counted as internal dependencies
+- `part of` relations still rely on best-effort matching rather than full library resolution
 
 For most real-world Flutter projects the accuracy is sufficient for architectural analysis.

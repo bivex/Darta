@@ -2,7 +2,7 @@
 """
 Darta v1.0 — Dart/Flutter Architecture Analyzer
 A static analysis tool for Dart/Flutter projects.
-Usage: python darta.py [--path <dir>] [--format json|html|md] [--output file|stdout]
+Usage: python darta.py [--path <dir>] [--format json|html|md] [--output file|stdout] [--component-depth N]
 """
 
 import os
@@ -120,8 +120,16 @@ class ComponentInfo:
     name: str
     files: List[str] = field(default_factory=list)
     loc: int = 0
-    fanin: int = 0
-    fanout: int = 0
+    incoming_components: Set[str] = field(default_factory=set, repr=False)
+    outgoing_components: Set[str] = field(default_factory=set, repr=False)
+
+    @property
+    def fanin(self) -> int:
+        return len(self.incoming_components)
+
+    @property
+    def fanout(self) -> int:
+        return len(self.outgoing_components)
 
     @property
     def stability(self) -> float:
@@ -155,8 +163,12 @@ class Smell:
 class DartParser:
     """Regex-based Dart file parser. No full AST — pattern matching only."""
 
+    AGGREGATE_COMPONENT_DIRS = {'feature', 'features', 'module', 'modules'}
+
     # Patterns
     IMPORT_RE = re.compile(r"""^\s*import\s+['"]([^'"]+)['"]\s*(?:as\s+\w+)?\s*;""")
+    EXPORT_RE = re.compile(r"""^\s*export\s+['"]([^'"]+)['"]\s*;""")
+    PART_RE = re.compile(r"""^\s*part\s+(?!of\b)['"]([^'"]+)['"]\s*;""")
     CLASS_RE = re.compile(
         r"""^\s*(?:abstract\s+)?class\s+(\w+)"""
         r"""(?:\s+extends\s+(\w+))?"""
@@ -187,8 +199,8 @@ class DartParser:
         'rethrow', 'assert', 'is', 'as', 'in', 'get', 'set', 'operator',
     }
 
-    def __init__(self):
-        pass
+    def __init__(self, component_depth: Optional[int] = None):
+        self.component_depth = component_depth
 
     def remove_comments_and_strings(self, source: str) -> Tuple[str, List[str]]:
         """Strip comments and string literals, return clean source + line list."""
@@ -254,10 +266,16 @@ class DartParser:
         clean_source, fi.clean_lines = self.remove_comments_and_strings(source)
 
         # Parse imports
+        seen_directives = set()
         for ln in fi.clean_lines:
-            m = self.IMPORT_RE.match(ln)
-            if m:
-                fi.imports.append(m.group(1))
+            for pattern in (self.IMPORT_RE, self.EXPORT_RE, self.PART_RE):
+                m = pattern.match(ln)
+                if m:
+                    directive = m.group(1)
+                    if directive not in seen_directives:
+                        fi.imports.append(directive)
+                        seen_directives.add(directive)
+                    break
 
         # Parse classes and methods
         fi.classes = self._parse_classes(fi.clean_lines, path)
@@ -270,7 +288,16 @@ class DartParser:
         # rel_path is relative to lib_root (the lib/ dir itself)
         if len(parts) == 1:
             return "root"
-        return parts[0]
+        directories = parts[:-1]
+
+        if self.component_depth is not None:
+            depth = max(1, min(self.component_depth, len(directories)))
+            return '/'.join(directories[:depth])
+
+        if directories[0] in self.AGGREGATE_COMPONENT_DIRS and len(directories) >= 2:
+            return '/'.join(directories[:2])
+
+        return directories[0]
 
     def _parse_classes(self, lines: List[str], path: str) -> List[ClassInfo]:
         """Extract class definitions with their methods and fields."""
@@ -437,6 +464,7 @@ class MetricsComputer:
         # Map from relative path (normalized) to FileInfo
         self.rel_map: Dict[str, FileInfo] = {f.rel_path: f for f in files}
         self.components: Dict[str, ComponentInfo] = {}
+        self.file_dependencies: Dict[str, List[FileInfo]] = {}
 
     def compute_all(self):
         """Run all metric computations in order."""
@@ -449,7 +477,7 @@ class MetricsComputer:
 
     def _resolve_import(self, importing_file: FileInfo, import_path: str) -> Optional[FileInfo]:
         """Resolve a Dart import string to a FileInfo if it's a local file."""
-        # Only resolve relative or package imports pointing back to lib/
+        # Only resolve local file references or package imports pointing back to lib/
         if import_path.startswith('dart:') or import_path.startswith('package:flutter'):
             return None
         # package: imports — strip package prefix
@@ -466,8 +494,8 @@ class MetricsComputer:
                 if local_path in self.rel_map:
                     return self.rel_map[local_path]
             return None
-        # Relative import
-        if import_path.startswith('.'):
+        # Relative URI import/export/part. Dart allows both './foo.dart' and 'foo/bar.dart'.
+        if ':' not in import_path:
             base = os.path.dirname(importing_file.path)
             resolved = os.path.normpath(os.path.join(base, import_path))
             if resolved in self.file_map:
@@ -477,13 +505,27 @@ class MetricsComputer:
     def _compute_fan_metrics(self):
         """Compute FANOUT (internal imports) and FANIN (imported by others)."""
         for fi in self.files:
-            fanout = 0
-            for imp in fi.imports:
-                target = self._resolve_import(fi, imp)
-                if target and target.path != fi.path:
-                    fanout += 1
-                    target.fanin += 1
-            fi.fanout = fanout
+            fi.fanin = 0
+            fi.fanout = 0
+
+        for fi in self.files:
+            targets = self._resolve_local_dependencies(fi)
+            self.file_dependencies[fi.path] = targets
+            fi.fanout = len(targets)
+            for target in targets:
+                target.fanin += 1
+
+    def _resolve_local_dependencies(self, fi: FileInfo) -> List[FileInfo]:
+        """Resolve unique internal dependencies for a file."""
+        targets = []
+        seen_paths = set()
+        for imp in fi.imports:
+            target = self._resolve_import(fi, imp)
+            if not target or target.path == fi.path or target.path in seen_paths:
+                continue
+            seen_paths.add(target.path)
+            targets.append(target)
+        return targets
 
     def _compute_dit(self):
         """Depth of Inheritance Tree per class."""
@@ -523,11 +565,10 @@ class MetricsComputer:
 
         # Component coupling: count cross-component imports
         for fi in self.files:
-            for imp in fi.imports:
-                target = self._resolve_import(fi, imp)
-                if target and target.component != fi.component:
-                    comp_map[fi.component].fanout += 1
-                    comp_map[target.component].fanin += 1
+            for target in self.file_dependencies.get(fi.path, []):
+                if target.component != fi.component:
+                    comp_map[fi.component].outgoing_components.add(target.component)
+                    comp_map[target.component].incoming_components.add(fi.component)
 
         self.components = comp_map
 
@@ -835,49 +876,60 @@ class SmellDetector:
             ))
 
     def _check_unstable_dependency(self):
-        comp_list = list(self.components.values())
-        for a in comp_list:
-            for b in comp_list:
-                if a.name == b.name:
-                    continue
-                if a.stability > 0.7 and b.stability < 0.4:
-                    # Check if a actually imports b (approximation via fanout)
-                    if a.fanout > 0 and b.fanin > 0:
-                        self.architecture_smells.append(Smell(
-                            smell="Unstable Dependency",
-                            severity="HIGH",
-                            reasons=[
-                                f"'{a.name}' (stability={a.stability:.2f}) "
-                                f"depends on '{b.name}' (stability={b.stability:.2f})"
-                            ],
-                            suggestion="Stable components should not depend on unstable ones. "
-                                       "Introduce an abstraction layer.",
-                            component=a.name,
-                        ))
-                        break  # one smell per component pair
+        for source in self.components.values():
+            if source.stability >= 0.4:
+                continue
+
+            unstable_targets = []
+            for target_name in sorted(source.outgoing_components):
+                target = self.components.get(target_name)
+                if target and target.stability > 0.7:
+                    unstable_targets.append(f"{target.name} ({target.stability:.2f})")
+
+            if unstable_targets:
+                self.architecture_smells.append(Smell(
+                    smell="Unstable Dependency",
+                    severity="HIGH",
+                    reasons=[
+                        f"'{source.name}' is relatively stable (stability={source.stability:.2f})",
+                        f"Direct dependencies on unstable components: {', '.join(unstable_targets)}",
+                    ],
+                    suggestion="Stable components should not depend on unstable ones. "
+                               "Invert the dependency direction or introduce an abstraction layer.",
+                    component=source.name,
+                ))
 
     def _check_feature_concentration(self):
-        """Detect components with classes covering > 3 distinct concerns."""
-        UI_TERMS = {'widget', 'screen', 'page', 'view', 'button', 'dialog', 'modal'}
-        DATA_TERMS = {'repository', 'dao', 'database', 'cache', 'storage', 'model', 'entity'}
-        LOGIC_TERMS = {'service', 'usecase', 'interactor', 'manager', 'controller', 'bloc', 'cubit', 'provider'}
+        """Detect components that mix too many architectural concerns."""
+        concern_terms = {
+            'UI': {'widget', 'screen', 'page', 'view', 'button', 'dialog', 'modal'},
+            'Data': {'repository', 'dao', 'database', 'cache', 'storage', 'model', 'entity', 'dto'},
+            'Logic': {'service', 'usecase', 'interactor', 'manager', 'controller', 'coordinator'},
+            'State': {'bloc', 'cubit', 'provider', 'notifier', 'state', 'store'},
+            'Infrastructure': {'api', 'client', 'remote', 'network', 'http', 'dio', 'socket', 'platform', 'channel'},
+        }
 
         for comp_name, ci in self.components.items():
-            concerns = set()
+            if ci.file_count < 4:
+                continue
+
+            concern_hits = defaultdict(list)
             for path in ci.files:
-                fname = os.path.basename(path).lower()
-                if any(t in fname for t in UI_TERMS):
-                    concerns.add('UI')
-                if any(t in fname for t in DATA_TERMS):
-                    concerns.add('Data')
-                if any(t in fname for t in LOGIC_TERMS):
-                    concerns.add('Logic')
-            if len(concerns) > 3:
+                tokens = ' '.join(part.lower() for part in Path(path).parts[-3:])
+                for concern, terms in concern_terms.items():
+                    if any(term in tokens for term in terms):
+                        concern_hits[concern].append(os.path.basename(path))
+
+            if len(concern_hits) > 3:
+                summary = ', '.join(
+                    f"{concern} ({len(files)})"
+                    for concern, files in sorted(concern_hits.items())
+                )
                 self.architecture_smells.append(Smell(
                     smell="Feature Concentration",
                     severity="MEDIUM",
-                    reasons=[f"Concerns detected: {', '.join(concerns)}"],
-                    suggestion="Organize files by layer (UI/Data/Logic) into separate directories.",
+                    reasons=[f"Concerns detected: {summary}"],
+                    suggestion="Organize files into focused UI, state, logic, data, and infrastructure directories.",
                     component=comp_name,
                 ))
 
@@ -903,6 +955,7 @@ def compute_health(smells_arch: List[Smell], smells_design: List[Smell],
         counts["God Component"] * 100 +
         counts["Unstable Dependency"] * 80 +
         counts["Dense Structure"] * 40 +
+        counts["Feature Concentration"] * 35 +
         counts["Hub-like Modularization"] * 60 +
         counts["Insufficient Modularization"] * 30 +
         counts["Deficient Encapsulation"] * 20 +
@@ -935,6 +988,9 @@ def build_recommendations(smells_arch, smells_design, smells_impl) -> List[Dict]
                       "Apply Single Responsibility Principle — split the class."),
         "Dense Structure": ("HIGH", "Architecture", "Component has too many external dependencies.",
                             "Use dependency injection and reduce coupling."),
+        "Feature Concentration": ("MEDIUM", "Architecture",
+                                  "A single component mixes too many architectural concerns.",
+                                  "Split the component into focused UI, state, domain, data, or infrastructure slices."),
         "Hub-like Modularization": ("HIGH", "Design", "File is both imported by and imports many others.",
                                     "Extract shared logic to a dedicated module."),
         "Complex Method": ("HIGH", "Implementation", "Methods with high cyclomatic complexity.",
@@ -1004,9 +1060,11 @@ class JSONReporter:
             "code_health": {
                 "health_score": health,
                 "technical_debt_score": debt,
+                "architecture_smells_total": len(smells_arch),
                 "god_classes": sum(1 for s in smells_design if s.smell == "God Class"),
                 "god_components": sum(1 for s in smells_arch if s.smell == "God Component"),
                 "unstable_dependencies": sum(1 for s in smells_arch if s.smell == "Unstable Dependency"),
+                "feature_concentrations": sum(1 for s in smells_arch if s.smell == "Feature Concentration"),
                 "implementation_smells_total": len(smells_impl),
             },
             "architecture_smells": [
@@ -1049,6 +1107,8 @@ class JSONReporter:
                     "stability": round(ci.stability, 3),
                     "fanin": ci.fanin,
                     "fanout": ci.fanout,
+                    "depends_on": sorted(ci.outgoing_components),
+                    "used_by": sorted(ci.incoming_components),
                 }
                 for ci in components.values()
             ],
@@ -1419,12 +1479,21 @@ def main():
     parser = argparse.ArgumentParser(
         description="Darta v1.0 — Dart/Flutter Architecture Analyzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Examples:\n  python darta.py\n  python darta.py --path ~/myapp --format json\n  python darta.py --format md --output stdout"
+        epilog="Examples:\n  python darta.py\n  python darta.py --path ~/myapp --format json\n  python darta.py --component-depth 2 --format md --output stdout"
     )
     parser.add_argument('--path', default='.', help='Path to Flutter/Dart project (default: current dir)')
     parser.add_argument('--format', choices=['html', 'json', 'md'], default='html', help='Output format')
     parser.add_argument('--output', default='file', help='"stdout" or a file path. Default: saves DARTA_REPORT.<ext>')
+    parser.add_argument(
+        '--component-depth',
+        type=int,
+        default=None,
+        help='Override component grouping depth under lib/. Default: auto (first dir, or first two for features/modules).'
+    )
     args = parser.parse_args()
+
+    if args.component_depth is not None and args.component_depth < 1:
+        parser.error('--component-depth must be a positive integer')
 
     project_path = os.path.abspath(args.path)
     project_name = os.path.basename(project_path)
@@ -1445,7 +1514,7 @@ def main():
 
     # Parse
     print("  Parsing files...", file=sys.stderr)
-    dart_parser = DartParser()
+    dart_parser = DartParser(component_depth=args.component_depth)
     files: List[FileInfo] = []
     for path in dart_files:
         fi = dart_parser.parse_file(path, lib_root)
