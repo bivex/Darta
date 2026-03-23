@@ -233,20 +233,40 @@ class DartParser:
         return '\n'.join(clean_lines), clean_lines
 
     def _strip_line_comment(self, line: str) -> str:
-        """Remove // comments, respecting string literals."""
+        """Remove // comments and string literal contents, respecting quotes."""
         in_single = False
         in_double = False
+        result = []
         i = 0
         while i < len(line):
             c = line[i]
             if c == "'" and not in_double:
-                in_single = not in_single
+                if in_single:
+                    in_single = False
+                    result.append("''")  # keep quotes, drop content
+                else:
+                    in_single = True
+                    # consume string content below
+                i += 1
+                continue
             elif c == '"' and not in_single:
-                in_double = not in_double
-            elif c == '/' and i + 1 < len(line) and line[i + 1] == '/' and not in_single and not in_double:
-                return line[:i]
+                if in_double:
+                    in_double = False
+                    result.append('""')
+                else:
+                    in_double = True
+                i += 1
+                continue
+            elif in_single or in_double:
+                # skip string content — don't add to result
+                i += 1
+                continue
+            elif c == '/' and i + 1 < len(line) and line[i + 1] == '/':
+                break  # rest is comment
+            else:
+                result.append(c)
             i += 1
-        return line
+        return ''.join(result)
 
     def parse_file(self, path: str, lib_root: str) -> Optional[FileInfo]:
         """Parse a single .dart file and return FileInfo."""
@@ -686,7 +706,7 @@ class SmellDetector:
                     ))
 
     def _check_magic_numbers(self, fi: FileInfo):
-        for i, ln in enumerate(fi.raw_lines, 1):
+        for i, ln in enumerate(fi.clean_lines, 1):
             # Skip const/final lines
             if re.search(r'\b(const|final)\b', ln):
                 continue
