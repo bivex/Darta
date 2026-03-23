@@ -94,6 +94,7 @@ class FileInfo:
     component: str
     raw_lines: List[str] = field(default_factory=list)
     clean_lines: List[str] = field(default_factory=list)
+    analysis_lines: List[str] = field(default_factory=list)
     imports: List[str] = field(default_factory=list)
     classes: List[ClassInfo] = field(default_factory=list)
     fanin: int = 0
@@ -202,71 +203,95 @@ class DartParser:
     def __init__(self, component_depth: Optional[int] = None):
         self.component_depth = component_depth
 
-    def remove_comments_and_strings(self, source: str) -> Tuple[str, List[str]]:
-        """Strip comments and string literals, return clean source + line list."""
-        lines = source.split('\n')
-        clean_lines = []
-        in_block_comment = False
-        for ln in lines:
-            if in_block_comment:
-                end = ln.find('*/')
-                if end != -1:
-                    in_block_comment = False
-                    ln = ln[end + 2:]
-                else:
-                    clean_lines.append('')
-                    continue
-            # Remove block comments on same line
-            while '/*' in ln and not in_block_comment:
-                start = ln.find('/*')
-                end = ln.find('*/', start + 2)
-                if end != -1:
-                    ln = ln[:start] + ' ' * (end + 2 - start) + ln[end + 2:]
-                else:
-                    ln = ln[:start]
-                    in_block_comment = True
-                    break
-            # Remove line comments
-            # Handle strings first to avoid stripping URLs etc.
-            result = self._strip_line_comment(ln)
-            clean_lines.append(result)
-        return '\n'.join(clean_lines), clean_lines
+    def remove_comments(self, source: str) -> Tuple[str, List[str]]:
+        """Strip comments while preserving string literals for parsing."""
+        return self._sanitize_source(source, strip_strings=False)
 
-    def _strip_line_comment(self, line: str) -> str:
-        """Remove // comments and string literal contents, respecting quotes."""
-        in_single = False
-        in_double = False
+    def remove_comments_and_strings(self, source: str) -> Tuple[str, List[str]]:
+        """Strip comments and string literals for smell detection."""
+        return self._sanitize_source(source, strip_strings=True)
+
+    def _sanitize_source(self, source: str, strip_strings: bool) -> Tuple[str, List[str]]:
+        """Sanitize source while preserving newlines and respecting Dart string/comment syntax."""
         result = []
         i = 0
-        while i < len(line):
-            c = line[i]
-            if c == "'" and not in_double:
-                if in_single:
-                    in_single = False
-                    result.append("''")  # keep quotes, drop content
-                else:
-                    in_single = True
-                    # consume string content below
+        n = len(source)
+        in_line_comment = False
+        in_block_comment = False
+        string_quote = ''
+        triple_quote = False
+        raw_string = False
+
+        while i < n:
+            c = source[i]
+
+            if in_line_comment:
+                if c == '\n':
+                    in_line_comment = False
+                    result.append('\n')
                 i += 1
                 continue
-            elif c == '"' and not in_single:
-                if in_double:
-                    in_double = False
-                    result.append('""')
-                else:
-                    in_double = True
+
+            if in_block_comment:
+                if i + 1 < n and source[i:i + 2] == '*/':
+                    in_block_comment = False
+                    i += 2
+                    continue
+                if c == '\n':
+                    result.append('\n')
                 i += 1
                 continue
-            elif in_single or in_double:
-                # skip string content — don't add to result
+
+            if string_quote:
+                closing = string_quote * 3 if triple_quote else string_quote
+                if source.startswith(closing, i):
+                    if not strip_strings:
+                        result.append(closing)
+                    string_quote = ''
+                    triple_quote = False
+                    raw_string = False
+                    i += len(closing)
+                    continue
+                if c == '\n':
+                    result.append('\n')
+                    i += 1
+                    continue
+                if not triple_quote and not raw_string and c == '\\' and i + 1 < n:
+                    if not strip_strings:
+                        result.append(source[i:i + 2])
+                    i += 2
+                    continue
+                if not strip_strings:
+                    result.append(c)
                 i += 1
                 continue
-            elif c == '/' and i + 1 < len(line) and line[i + 1] == '/':
-                break  # rest is comment
-            else:
-                result.append(c)
+
+            if i + 1 < n and source[i:i + 2] == '//':
+                in_line_comment = True
+                i += 2
+                continue
+
+            if i + 1 < n and source[i:i + 2] == '/*':
+                in_block_comment = True
+                i += 2
+                continue
+
+            if c in ("'", '"'):
+                prev = source[i - 1] if i > 0 else ''
+                prev2 = source[i - 2] if i > 1 else ''
+                raw_string = prev in ('r', 'R') and not (prev2.isalnum() or prev2 == '_')
+                triple_quote = source.startswith(c * 3, i)
+                string_quote = c
+                if not strip_strings:
+                    result.append(c * 3 if triple_quote else c)
+                i += 3 if triple_quote else 1
+                continue
+
+            result.append(c)
             i += 1
-        return ''.join(result)
+
+        sanitized = ''.join(result)
+        return sanitized, sanitized.split('\n')
 
     def parse_file(self, path: str, lib_root: str) -> Optional[FileInfo]:
         """Parse a single .dart file and return FileInfo."""
@@ -283,7 +308,8 @@ class DartParser:
         fi = FileInfo(path=path, rel_path=rel, component=component)
         fi.raw_lines = source.split('\n')
 
-        clean_source, fi.clean_lines = self.remove_comments_and_strings(source)
+        _, fi.clean_lines = self.remove_comments(source)
+        _, fi.analysis_lines = self.remove_comments_and_strings(source)
 
         # Parse imports
         seen_directives = set()
@@ -706,7 +732,7 @@ class SmellDetector:
                     ))
 
     def _check_magic_numbers(self, fi: FileInfo):
-        for i, ln in enumerate(fi.clean_lines, 1):
+        for i, ln in enumerate(fi.analysis_lines, 1):
             # Skip const/final lines
             if re.search(r'\b(const|final)\b', ln):
                 continue
