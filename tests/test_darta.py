@@ -35,7 +35,7 @@ Room 101
 Version 9000
 ''';
     const ignored = 7;
-    final count = 5;
+    var count = 5;
     // 999
   }
 }
@@ -50,7 +50,8 @@ Version 9000
             self.assertEqual(len(detector.implementation_smells), 1)
             smell = detector.implementation_smells[0]
             self.assertEqual(smell.smell, 'Magic Number')
-            self.assertEqual(smell.line, 8)
+            expected_line = source.splitlines().index('    var count = 5;') + 1
+            self.assertEqual(smell.line, expected_line)
 
 
 if __name__ == '__main__':
