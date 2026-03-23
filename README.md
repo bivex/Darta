@@ -1,0 +1,182 @@
+# Darta v1.0 — Dart/Flutter Architecture Analyzer
+
+A single-file Python 3.7+ static analysis tool for Dart/Flutter projects.
+Produces rich HTML, JSON, or Markdown reports covering implementation,
+design, and architecture smells — with no Dart toolchain required.
+
+---
+
+## Installation
+
+```bash
+cd /path/to/Darta
+bash install.sh
+```
+
+This creates a symlink at `/usr/local/bin/darta` so you can run `darta` from anywhere.
+
+---
+
+## Usage
+
+```
+python darta.py [--path <dir>] [--format json|html|md] [--output file|stdout]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--path` | `.` (current dir) | Path to Flutter/Dart project root |
+| `--format` | `html` | Output format: `html`, `json`, or `md` |
+| `--output` | `file` | `file` saves `DARTA_REPORT.<ext>` in project root; `stdout` prints to terminal; or provide an explicit file path |
+
+### Examples
+
+```bash
+# Analyze current directory, save DARTA_REPORT.html
+darta
+
+# Analyze a specific project
+darta --path ~/projects/my_flutter_app
+
+# JSON output to stdout (pipe-friendly)
+darta --path ~/projects/my_flutter_app --format json --output stdout
+
+# Markdown report saved to a custom path
+darta --path ~/projects/my_flutter_app --format md --output ~/reports/report.md
+
+# HTML report for CI (write to stdout, redirect to file)
+darta --format html --output stdout > report.html
+```
+
+---
+
+## What It Analyzes
+
+Darta walks the `lib/` directory and parses every `.dart` file using regex patterns.
+
+### Metrics (per class and file)
+
+| Metric | Description |
+|--------|-------------|
+| LOC | Non-blank, non-comment lines |
+| CC | Cyclomatic complexity |
+| PC | Parameter count per method |
+| NOF | Number of fields |
+| NOPF | Number of public fields |
+| NOM | Number of methods |
+| NOPM | Number of public methods |
+| WMC | Weighted Method Count (sum of CC) |
+| DIT | Depth of Inheritance Tree |
+| FANIN | Files that import this file |
+| FANOUT | Files this file imports (internal only) |
+
+### Smells Detected
+
+**Implementation smells** (per method/file):
+- Long Method (> 30 lines)
+- Complex Method (CC > 10)
+- Long Parameter List (> 4 params)
+- Long Statement (line > 120 chars)
+- Long Identifier (name > 30 chars)
+- Magic Number (numeric literals > 2 not in const/final)
+- Empty Catch Clause
+- Missing Default (switch without default)
+- Long Message Chain (> 3 chained calls)
+
+**Design smells** (per class):
+- God Class
+- Insufficient Modularization
+- Deficient Encapsulation
+- Hub-like Modularization
+- Multifaceted Abstraction
+
+**Architecture smells** (per component = first-level directory under lib/):
+- God Component
+- Dense Structure
+- Unstable Dependency
+- Feature Concentration
+
+### Health Score
+
+```
+Technical Debt Score =
+  God Class × 50 + God Component × 100 + Unstable Dependency × 80 +
+  Dense Structure × 40 + Hub-like × 60 + Insufficient Mod × 30 +
+  Deficient Encap × 20 + Long Method × 5 + Complex Method × 10 +
+  Magic Number × 2
+
+Health Score = max(0, 100 - TechnicalDebt / 10)
+```
+
+- **Green (≥ 80):** Healthy codebase
+- **Yellow (60–79):** Moderate issues
+- **Red (< 60):** Significant refactoring needed
+
+---
+
+## Output Formats
+
+### HTML (default)
+Dark-theme single-file report with:
+- Health score badge
+- KPI cards
+- Collapsible smell cards with severity badges
+- Components and files inventory tables
+- Actionable recommendations
+
+No external CDN dependencies — fully self-contained.
+
+### JSON
+Machine-readable output following the schema:
+```json
+{
+  "meta": { ... },
+  "summary_kpis": { ... },
+  "code_health": { ... },
+  "architecture_smells": [ ... ],
+  "design_smells": [ ... ],
+  "implementation_smells": [ ... ],
+  "components": [ ... ],
+  "files_inventory": [ ... ],
+  "classes_inventory": [ ... ],
+  "actionable_recommendations": [ ... ]
+}
+```
+
+### Markdown
+Human-readable report suitable for GitHub issues, Confluence, or Notion.
+
+---
+
+## Requirements
+
+- Python 3.7+
+- No external dependencies (uses only stdlib: `os`, `re`, `sys`, `json`, `argparse`, `dataclasses`, `pathlib`, `collections`, `datetime`, `math`)
+
+---
+
+## How Components Are Defined
+
+A **component** is the first subdirectory under `lib/`:
+- `lib/core/foo.dart` → component `core`
+- `lib/features/auth/login.dart` → component `features`
+- `lib/main.dart` → component `root`
+
+Component **stability** = Ce / (Ca + Ce), where:
+- Ce = efferent coupling (cross-component imports made)
+- Ca = afferent coupling (cross-component imports received)
+
+A stability of 1.0 means fully instable (all dependencies go outward).
+A stability of 0.0 means fully stable (only depended upon, never imports).
+
+---
+
+## Limitations
+
+Since Darta uses regex (not a full Dart AST parser):
+- Deeply nested or unusual formatting may cause missed or incorrect detections
+- Generic type parameters in complex positions may not parse perfectly
+- Macro-generated or heavily annotated code may show false positives
+- `part` / `part of` barrel files are counted but not specially handled
+
+For most real-world Flutter projects the accuracy is sufficient for architectural analysis.
