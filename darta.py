@@ -11,11 +11,17 @@ import sys
 import json
 import argparse
 import math
+from fnmatch import fnmatchcase
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Set
+from typing import Any, List, Dict, Optional, Tuple, Set
 from pathlib import Path
 from collections import defaultdict
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - exercised only when PyYAML is unavailable
+    yaml = None
 
 # ─────────────────────────────────────────────
 # SECTION 1: Data Classes
@@ -91,6 +97,7 @@ class ClassInfo:
 class FileInfo:
     path: str
     rel_path: str
+    project_rel_path: str
     component: str
     raw_lines: List[str] = field(default_factory=list)
     clean_lines: List[str] = field(default_factory=list)
@@ -157,6 +164,292 @@ class Smell:
     line: int = 0
 
 
+@dataclass
+class ComponentPattern:
+    name: str
+    include: List[str]
+    exclude: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DependencyRule:
+    source: str
+    allow: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ForbiddenPackageRule:
+    components: List[str]
+    packages: List[str]
+    reason: str = ""
+
+
+@dataclass
+class FileImportRule:
+    name: str
+    from_patterns: List[str]
+    to_patterns: List[str]
+    severity: str = "warning"
+    description: str = ""
+
+
+@dataclass
+class Waiver:
+    rule: str
+    from_patterns: List[str]
+    to_patterns: List[str]
+    reason: str = ""
+    priority: str = "medium"
+
+
+@dataclass
+class DartaConfig:
+    path: str = ""
+    project_name: str = ""
+    component_mode: str = "auto"
+    component_depth: Optional[int] = None
+    ignore_paths: List[str] = field(default_factory=list)
+    components: List[ComponentPattern] = field(default_factory=list)
+    layers: Dict[str, List[str]] = field(default_factory=dict)
+    component_layers: Dict[str, str] = field(default_factory=dict)
+    dependency_rules: List[DependencyRule] = field(default_factory=list)
+    forbidden_packages: List[ForbiddenPackageRule] = field(default_factory=list)
+    file_rules: List[FileImportRule] = field(default_factory=list)
+    cycles: Dict[str, str] = field(default_factory=dict)
+    budgets: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    waivers: List[Waiver] = field(default_factory=list)
+    smell_settings: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    reporting: Dict[str, Any] = field(default_factory=dict)
+
+    def is_ignored(self, project_rel_path: str) -> bool:
+        return any(match_path_pattern(project_rel_path, pattern) for pattern in self.ignore_paths)
+
+    def resolve_component(self, project_rel_path: str, fallback_component: str) -> str:
+        if not self.components:
+            return fallback_component
+
+        for rule in self.components:
+            if not any(match_path_pattern(project_rel_path, pattern) for pattern in rule.include):
+                continue
+            if any(match_path_pattern(project_rel_path, pattern) for pattern in rule.exclude):
+                continue
+            return rule.name
+
+        return fallback_component
+
+    def layer_for_component(self, component: str) -> Optional[str]:
+        return self.component_layers.get(component)
+
+    def allowed_targets_for_component(self, component: str) -> Optional[List[str]]:
+        for rule in self.dependency_rules:
+            if match_name_pattern(component, rule.source):
+                return rule.allow
+        return None
+
+    def find_waiver(self, rule_name: str, from_path: str, to_path: str) -> Optional[Waiver]:
+        for waiver in self.waivers:
+            if waiver.rule not in (rule_name, "*"):
+                continue
+            if not any(match_path_pattern(from_path, pattern) for pattern in waiver.from_patterns):
+                continue
+            if not any(match_path_pattern(to_path, pattern) for pattern in waiver.to_patterns):
+                continue
+            return waiver
+        return None
+
+
+def normalize_path(path: str) -> str:
+    normalized = path.replace(os.sep, '/')
+    while normalized.startswith('./'):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _split_segments(path: str) -> List[str]:
+    normalized = normalize_path(path).strip('/')
+    if not normalized or normalized == '.':
+        return []
+    return normalized.split('/')
+
+
+def match_path_pattern(path: str, pattern: str) -> bool:
+    path_segments = _split_segments(path)
+    pattern_segments = _split_segments(pattern)
+
+    def _match(path_index: int, pattern_index: int) -> bool:
+        if pattern_index == len(pattern_segments):
+            return path_index == len(path_segments)
+        token = pattern_segments[pattern_index]
+        if token == '**':
+            if pattern_index == len(pattern_segments) - 1:
+                return True
+            for next_index in range(path_index, len(path_segments) + 1):
+                if _match(next_index, pattern_index + 1):
+                    return True
+            return False
+        if path_index >= len(path_segments):
+            return False
+        if not fnmatchcase(path_segments[path_index], token):
+            return False
+        return _match(path_index + 1, pattern_index + 1)
+
+    return _match(0, 0)
+
+
+def match_name_pattern(name: str, pattern: str) -> bool:
+    if pattern == '*':
+        return True
+    return match_path_pattern(name, pattern)
+
+
+def config_severity(level: str, default: str = "MEDIUM") -> str:
+    mapping = {
+        'error': 'HIGH',
+        'critical': 'HIGH',
+        'warning': 'MEDIUM',
+        'warn': 'MEDIUM',
+        'info': 'LOW',
+        'low': 'LOW',
+        'medium': 'MEDIUM',
+        'high': 'HIGH',
+    }
+    return mapping.get(str(level or '').strip().lower(), default)
+
+
+def load_darta_config(project_path: str, config_path: Optional[str] = None) -> Optional[DartaConfig]:
+    candidate_paths = []
+    if config_path:
+        candidate_paths.append(os.path.abspath(config_path))
+    else:
+        candidate_paths.extend([
+            os.path.join(project_path, 'darta.yaml'),
+            os.path.join(project_path, 'darta.yml'),
+        ])
+
+    resolved_path = next((path for path in candidate_paths if os.path.isfile(path)), None)
+    if not resolved_path:
+        if config_path:
+            print(f"ERROR: Config file not found: {config_path}", file=sys.stderr)
+            sys.exit(1)
+        return None
+
+    if yaml is None:
+        print(
+            "ERROR: darta.yaml support requires PyYAML. Install it with `pip install pyyaml`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        with open(resolved_path, 'r', encoding='utf-8') as f:
+            raw = yaml.safe_load(f) or {}
+    except Exception as exc:
+        print(f"ERROR: Failed to read {resolved_path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(raw, dict):
+        print(f"ERROR: {resolved_path} must contain a YAML object at the root.", file=sys.stderr)
+        sys.exit(1)
+
+    analysis = raw.get('analysis') or {}
+    components = raw.get('components') or {}
+    layers = raw.get('layers') or {}
+    architecture = raw.get('architecture') or {}
+
+    component_rules = []
+    for name, spec in components.items():
+        spec = spec or {}
+        component_rules.append(ComponentPattern(
+            name=str(name),
+            include=[normalize_path(p) for p in (spec.get('include') or [])],
+            exclude=[normalize_path(p) for p in (spec.get('exclude') or [])],
+        ))
+
+    component_layers = {}
+    parsed_layers: Dict[str, List[str]] = {}
+    for layer_name, component_names in layers.items():
+        names = [str(name) for name in (component_names or [])]
+        parsed_layers[str(layer_name)] = names
+        for component_name in names:
+            component_layers[component_name] = str(layer_name)
+
+    dependency_rules = []
+    for rule in architecture.get('dependency_rules') or []:
+        dependency_rules.append(DependencyRule(
+            source=str(rule.get('from', '')),
+            allow=[str(name) for name in (rule.get('allow') or [])],
+        ))
+
+    forbidden_packages = []
+    for rule in architecture.get('forbidden_packages') or []:
+        forbidden_packages.append(ForbiddenPackageRule(
+            components=[str(name) for name in (rule.get('from') or [])],
+            packages=[str(name) for name in (rule.get('packages') or [])],
+            reason=str(rule.get('reason', '')).strip(),
+        ))
+
+    file_rules = []
+    for rule in architecture.get('file_rules') or []:
+        forbid_imports = rule.get('forbid_imports') or {}
+        file_rules.append(FileImportRule(
+            name=str(rule.get('name', 'unnamed_rule')),
+            from_patterns=[normalize_path(p) for p in (forbid_imports.get('from') or [])],
+            to_patterns=[normalize_path(p) for p in (forbid_imports.get('to') or [])],
+            severity=str(rule.get('severity', 'warning')),
+            description=str(rule.get('description', '')).strip(),
+        ))
+
+    waivers = []
+    for waiver in architecture.get('waivers') or []:
+        from_value = waiver.get('from')
+        to_value = waiver.get('to')
+        from_patterns = from_value if isinstance(from_value, list) else [from_value]
+        to_patterns = to_value if isinstance(to_value, list) else [to_value]
+        waivers.append(Waiver(
+            rule=str(waiver.get('rule', '*')),
+            from_patterns=[normalize_path(p) for p in from_patterns if p],
+            to_patterns=[normalize_path(p) for p in to_patterns if p],
+            reason=str(waiver.get('reason', '')).strip(),
+            priority=str(waiver.get('priority', 'medium')),
+        ))
+
+    component_depth = analysis.get('component_depth')
+    if component_depth is not None:
+        try:
+            component_depth = int(component_depth)
+        except (TypeError, ValueError):
+            component_depth = None
+
+    budgets = {}
+    for budget_name, budget_map in (architecture.get('budgets') or {}).items():
+        parsed_budget = {}
+        for key, value in (budget_map or {}).items():
+            try:
+                parsed_budget[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        budgets[str(budget_name)] = parsed_budget
+
+    return DartaConfig(
+        path=resolved_path,
+        project_name=str((raw.get('project') or {}).get('name', '')).strip(),
+        component_mode=str(analysis.get('component_mode', 'auto')),
+        component_depth=component_depth,
+        ignore_paths=[normalize_path(p) for p in (analysis.get('ignore_paths') or [])],
+        components=component_rules,
+        layers=parsed_layers,
+        component_layers=component_layers,
+        dependency_rules=dependency_rules,
+        forbidden_packages=forbidden_packages,
+        file_rules=file_rules,
+        cycles={str(k): str(v) for k, v in (architecture.get('cycles') or {}).items()},
+        budgets=budgets,
+        waivers=waivers,
+        smell_settings=raw.get('smells') or {},
+        reporting=raw.get('reporting') or {},
+    )
+
+
 # ─────────────────────────────────────────────
 # SECTION 2: Dart Parser
 # ─────────────────────────────────────────────
@@ -200,8 +493,12 @@ class DartParser:
         'rethrow', 'assert', 'is', 'as', 'in', 'get', 'set', 'operator',
     }
 
-    def __init__(self, component_depth: Optional[int] = None):
+    def __init__(self, component_depth: Optional[int] = None,
+                 project_root: Optional[str] = None,
+                 config: Optional[DartaConfig] = None):
         self.component_depth = component_depth
+        self.project_root = os.path.abspath(project_root) if project_root else None
+        self.config = config
 
     def remove_comments(self, source: str) -> Tuple[str, List[str]]:
         """Strip comments while preserving string literals for parsing."""
@@ -302,10 +599,12 @@ class DartParser:
             print(f"  [WARN] Cannot read {path}: {e}", file=sys.stderr)
             return None
 
-        rel = os.path.relpath(path, lib_root)
-        component = self._get_component(rel)
+        project_root = self.project_root or os.path.dirname(lib_root)
+        rel = normalize_path(os.path.relpath(path, lib_root))
+        project_rel = normalize_path(os.path.relpath(path, project_root))
+        component = self._get_component(rel, project_rel)
 
-        fi = FileInfo(path=path, rel_path=rel, component=component)
+        fi = FileInfo(path=path, rel_path=rel, project_rel_path=project_rel, component=component)
         fi.raw_lines = source.split('\n')
 
         _, fi.clean_lines = self.remove_comments(source)
@@ -328,8 +627,15 @@ class DartParser:
 
         return fi
 
-    def _get_component(self, rel_path: str) -> str:
+    def _get_component(self, rel_path: str, project_rel_path: str) -> str:
         """Get component name from relative path under lib/."""
+        default_component = self._infer_component(rel_path)
+        if self.config:
+            return self.config.resolve_component(project_rel_path, default_component)
+        return default_component
+
+    def _infer_component(self, rel_path: str) -> str:
+        """Infer component name from relative path under lib/."""
         parts = Path(rel_path).parts
         # rel_path is relative to lib_root (the lib/ dir itself)
         if len(parts) == 1:
@@ -630,16 +936,58 @@ class SmellDetector:
     CHAIN_RE = re.compile(r'(?:\.\w+\([^)]*\)){4,}')
     SWITCH_RE = re.compile(r'\bswitch\b')
     DEFAULT_RE = re.compile(r'\bdefault\s*:')
-    IDENTIFIER_RE = re.compile(r'\b([a-zA-Z_]\w{30,})\b')
+    IDENTIFIER_RE = re.compile(r'\b([a-zA-Z_]\w*)\b')
 
     WIDGET_BASES = {'StatelessWidget', 'StatefulWidget', 'State', 'Widget'}
 
-    def __init__(self, files: List[FileInfo], components: Dict[str, ComponentInfo]):
+    def __init__(self, files: List[FileInfo], components: Dict[str, ComponentInfo],
+                 file_dependencies: Optional[Dict[str, List[FileInfo]]] = None,
+                 config: Optional[DartaConfig] = None):
         self.files = files
         self.components = components
+        self.file_dependencies = file_dependencies or {}
+        self.config = config or DartaConfig()
+        self.file_map: Dict[str, FileInfo] = {f.path: f for f in files}
+        self.project_rel_map: Dict[str, FileInfo] = {f.project_rel_path: f for f in files}
         self.implementation_smells: List[Smell] = []
         self.design_smells: List[Smell] = []
         self.architecture_smells: List[Smell] = []
+        self.applied_waivers: List[Dict[str, str]] = []
+
+        impl_settings = self._config_section(self.config.smell_settings, 'implementation')
+        long_method_cfg = self._config_section(impl_settings, 'long_method')
+        long_parameter_cfg = self._config_section(impl_settings, 'long_parameter_list')
+        long_statement_cfg = self._config_section(impl_settings, 'long_statement')
+        long_identifier_cfg = self._config_section(impl_settings, 'long_identifier')
+        magic_number_cfg = self._config_section(impl_settings, 'magic_number')
+
+        self.long_method_threshold = self._as_int(long_method_cfg.get('threshold'), 30)
+        self.widget_build_threshold = self._as_int(
+            long_method_cfg.get('widget_build_threshold'),
+            self.long_method_threshold,
+        )
+        self.long_parameter_threshold = self._as_int(long_parameter_cfg.get('threshold'), 4)
+        self.long_statement_threshold = self._as_int(long_statement_cfg.get('threshold'), 120)
+        self.long_identifier_threshold = self._as_int(long_identifier_cfg.get('threshold'), 30)
+        self.long_identifier_ignore = {
+            str(name) for name in (long_identifier_cfg.get('ignore_exact') or [])
+        }
+
+        self.magic_number_ignore_in_strings = bool(
+            magic_number_cfg.get('ignore_in_strings', True)
+        )
+        self.magic_number_ignore_const_final = bool(
+            magic_number_cfg.get('ignore_const_final', True)
+        )
+        self.magic_number_ignore_duration = bool(
+            magic_number_cfg.get('ignore_duration_constructors', False)
+        )
+        self.magic_number_ignore_common_values = set()
+        for value in magic_number_cfg.get('ignore_common_ui_values') or []:
+            try:
+                self.magic_number_ignore_common_values.add(float(value))
+            except (TypeError, ValueError):
+                continue
 
     def detect_all(self):
         print("  Detecting implementation smells...", file=sys.stderr)
@@ -666,11 +1014,15 @@ class SmellDetector:
                     self._check_long_parameter_list(mi, ci, fi)
 
     def _check_long_method(self, mi: MethodInfo, ci: ClassInfo, fi: FileInfo):
-        if mi.loc > 30:
+        threshold = self.long_method_threshold
+        if mi.name == 'build' and self._is_widget_class(ci):
+            threshold = self.widget_build_threshold
+
+        if mi.loc > threshold:
             self.implementation_smells.append(Smell(
                 smell="Long Method",
-                severity="HIGH" if mi.loc > 60 else "MEDIUM",
-                reasons=[f"{mi.name} has {mi.loc} lines (threshold: 30)"],
+                severity="HIGH" if mi.loc > threshold * 1.75 else "MEDIUM",
+                reasons=[f"{mi.name} has {mi.loc} lines (threshold: {threshold})"],
                 suggestion="Extract parts of this method into smaller, named helper methods.",
                 file=fi.rel_path,
                 class_name=ci.name,
@@ -692,11 +1044,11 @@ class SmellDetector:
             ))
 
     def _check_long_parameter_list(self, mi: MethodInfo, ci: ClassInfo, fi: FileInfo):
-        if mi.param_count > 4:
+        if mi.param_count > self.long_parameter_threshold:
             self.implementation_smells.append(Smell(
                 smell="Long Parameter List",
                 severity="MEDIUM",
-                reasons=[f"{mi.name} has {mi.param_count} parameters (threshold: 4)"],
+                reasons=[f"{mi.name} has {mi.param_count} parameters (threshold: {self.long_parameter_threshold})"],
                 suggestion="Group parameters into a config object or use named parameters.",
                 file=fi.rel_path,
                 class_name=ci.name,
@@ -706,11 +1058,11 @@ class SmellDetector:
 
     def _check_long_statements(self, fi: FileInfo):
         for i, ln in enumerate(fi.raw_lines, 1):
-            if len(ln) > 120:
+            if len(ln) > self.long_statement_threshold:
                 self.implementation_smells.append(Smell(
                     smell="Long Statement",
                     severity="LOW",
-                    reasons=[f"Line {i} has {len(ln)} characters (threshold: 120)"],
+                    reasons=[f"Line {i} has {len(ln)} characters (threshold: {self.long_statement_threshold})"],
                     suggestion="Break long lines for readability.",
                     file=fi.rel_path,
                     line=i,
@@ -721,27 +1073,34 @@ class SmellDetector:
         for ln in fi.raw_lines:
             for m in self.IDENTIFIER_RE.finditer(ln):
                 ident = m.group(1)
+                if ident in DartParser.KEYWORDS or ident in self.long_identifier_ignore:
+                    continue
+                if len(ident) <= self.long_identifier_threshold:
+                    continue
                 if ident not in seen:
                     seen.add(ident)
                     self.implementation_smells.append(Smell(
                         smell="Long Identifier",
                         severity="LOW",
-                        reasons=[f"'{ident}' has {len(ident)} characters (threshold: 30)"],
+                        reasons=[f"'{ident}' has {len(ident)} characters (threshold: {self.long_identifier_threshold})"],
                         suggestion="Use a shorter, equally descriptive name.",
                         file=fi.rel_path,
                     ))
 
     def _check_magic_numbers(self, fi: FileInfo):
-        for i, ln in enumerate(fi.analysis_lines, 1):
-            # Skip const/final lines
-            if re.search(r'\b(const|final)\b', ln):
+        lines = fi.analysis_lines if self.magic_number_ignore_in_strings else fi.clean_lines
+        for i, ln in enumerate(lines, 1):
+            if self.magic_number_ignore_const_final and re.search(r'\b(const|final)\b', ln):
+                continue
+            if self.magic_number_ignore_duration and 'Duration(' in ln:
                 continue
             for m in self.MAGIC_NUM_RE.finditer(ln):
                 val = m.group(1)
-                # Skip 0, 1, 2 as they're commonly acceptable
                 try:
                     num = float(val)
                     if abs(num) <= 2:
+                        continue
+                    if self._number_is_ignored(num):
                         continue
                 except ValueError:
                     continue
@@ -875,8 +1234,7 @@ class SmellDetector:
             ))
 
     def _check_multifaceted(self, ci: ClassInfo, fi: FileInfo):
-        is_widget = (ci.extends in self.WIDGET_BASES or
-                     any(b in self.WIDGET_BASES for b in ci.mixins))
+        is_widget = self._is_widget_class(ci)
         if ci.wmc > 30 and fi.fanout > 5 and not is_widget:
             self.design_smells.append(Smell(
                 smell="Multifaceted Abstraction",
@@ -895,6 +1253,11 @@ class SmellDetector:
             self._check_dense_structure(ci)
         self._check_unstable_dependency()
         self._check_feature_concentration()
+        self._check_dependency_rule_violations()
+        self._check_forbidden_package_dependencies()
+        self._check_file_rule_violations()
+        self._check_cycle_violations()
+        self._check_budget_violations()
 
     def _check_god_component(self, ci: ComponentInfo):
         if ci.loc > 2000 or ci.file_count > 15:
@@ -979,6 +1342,339 @@ class SmellDetector:
                     component=comp_name,
                 ))
 
+    def _check_dependency_rule_violations(self):
+        if not self.config.dependency_rules:
+            return
+
+        for source in self.files:
+            allowed_targets = self.config.allowed_targets_for_component(source.component)
+            if allowed_targets is None:
+                continue
+
+            for target in self.file_dependencies.get(source.path, []):
+                if target.component == source.component:
+                    continue
+                if any(match_name_pattern(target.component, pattern) for pattern in allowed_targets):
+                    continue
+
+                waiver = self._find_matching_waiver(
+                    ['dependency_rules'],
+                    source.project_rel_path,
+                    target.project_rel_path,
+                )
+                if waiver:
+                    self._record_waiver(waiver, source.project_rel_path, target.project_rel_path)
+                    continue
+
+                allowed_desc = ', '.join(allowed_targets) if allowed_targets else '(no cross-component dependencies)'
+                self.architecture_smells.append(Smell(
+                    smell="Dependency Rule Violation",
+                    severity="HIGH",
+                    reasons=[
+                        f"Component '{source.component}' may depend only on: {allowed_desc}",
+                        f"{source.project_rel_path} imports {target.project_rel_path} ({target.component})",
+                    ],
+                    suggestion="Move the dependency behind an allowed contract, or document an intentional waiver in darta.yaml.",
+                    component=source.component,
+                    file=source.project_rel_path,
+                ))
+
+    def _check_forbidden_package_dependencies(self):
+        if not self.config.forbidden_packages:
+            return
+
+        for fi in self.files:
+            package_imports = [imp for imp in fi.imports if imp.startswith('package:')]
+            if not package_imports:
+                continue
+
+            for rule in self.config.forbidden_packages:
+                if not any(match_name_pattern(fi.component, component) for component in rule.components):
+                    continue
+
+                for package_import in package_imports:
+                    if package_import not in rule.packages:
+                        continue
+
+                    waiver = self._find_matching_waiver(
+                        ['forbidden_packages'],
+                        fi.project_rel_path,
+                        package_import,
+                    )
+                    if waiver:
+                        self._record_waiver(waiver, fi.project_rel_path, package_import)
+                        continue
+
+                    self.architecture_smells.append(Smell(
+                        smell="Forbidden Package Dependency",
+                        severity="HIGH",
+                        reasons=[
+                            f"Component '{fi.component}' must not import {package_import}",
+                            rule.reason or "This package is reserved for another architectural boundary.",
+                        ],
+                        suggestion="Move this SDK usage to the configured owning layer, or depend on an abstraction instead.",
+                        component=fi.component,
+                        file=fi.project_rel_path,
+                    ))
+
+    def _check_file_rule_violations(self):
+        if not self.config.file_rules:
+            return
+
+        for rule in self.config.file_rules:
+            for source in self.files:
+                if not any(match_path_pattern(source.project_rel_path, pattern) for pattern in rule.from_patterns):
+                    continue
+
+                for target in self.file_dependencies.get(source.path, []):
+                    if not any(match_path_pattern(target.project_rel_path, pattern) for pattern in rule.to_patterns):
+                        continue
+
+                    waiver = self._find_matching_waiver(
+                        [rule.name, 'file_rules'],
+                        source.project_rel_path,
+                        target.project_rel_path,
+                    )
+                    if waiver:
+                        self._record_waiver(waiver, source.project_rel_path, target.project_rel_path)
+                        continue
+
+                    description = rule.description or "A configured file-level import rule was violated."
+                    self.architecture_smells.append(Smell(
+                        smell="File Rule Violation",
+                        severity=config_severity(rule.severity),
+                        reasons=[
+                            f"Rule '{rule.name}' forbids this import.",
+                            description,
+                            f"{source.project_rel_path} imports {target.project_rel_path}",
+                        ],
+                        suggestion="Remove the direct import, or reshape the dependency through an allowed boundary.",
+                        component=source.component,
+                        file=source.project_rel_path,
+                    ))
+
+    def _check_cycle_violations(self):
+        if not self.config.cycles:
+            return
+
+        file_severity = self.config.cycles.get('files')
+        if file_severity:
+            graph = {
+                fi.project_rel_path: {
+                    target.project_rel_path
+                    for target in self.file_dependencies.get(fi.path, [])
+                }
+                for fi in self.files
+            }
+            self._append_cycle_smells(
+                graph,
+                smell_name="File Cycle",
+                severity=config_severity(file_severity),
+                suggestion="Break the file-level cycle by extracting an interface or shared helper.",
+            )
+
+        component_severity = self.config.cycles.get('components')
+        if component_severity:
+            graph = {
+                name: set(info.outgoing_components)
+                for name, info in self.components.items()
+            }
+            self._append_cycle_smells(
+                graph,
+                smell_name="Component Cycle",
+                severity=config_severity(component_severity),
+                suggestion="Refactor cross-component references so dependencies flow in one direction.",
+            )
+
+        layer_severity = self.config.cycles.get('layers')
+        if layer_severity and self.config.component_layers:
+            graph: Dict[str, Set[str]] = defaultdict(set)
+            for source_name, source in self.components.items():
+                source_layer = self.config.layer_for_component(source_name)
+                if not source_layer:
+                    continue
+                graph.setdefault(source_layer, set())
+                for target_name in source.outgoing_components:
+                    target_layer = self.config.layer_for_component(target_name)
+                    if target_layer and target_layer != source_layer:
+                        graph[source_layer].add(target_layer)
+                        graph.setdefault(target_layer, set())
+
+            self._append_cycle_smells(
+                graph,
+                smell_name="Layer Cycle",
+                severity=config_severity(layer_severity),
+                suggestion="Restore one-way layer flow by moving dependencies inward or introducing ports.",
+            )
+
+    def _check_budget_violations(self):
+        if not self.config.budgets:
+            return
+
+        fanout_budget = self.config.budgets.get('max_component_fanout') or {}
+        for component_name, component in self.components.items():
+            limit = self._resolve_named_budget(fanout_budget, component_name)
+            if limit is None or component.fanout <= limit:
+                continue
+            self.architecture_smells.append(Smell(
+                smell="Component Fanout Budget Exceeded",
+                severity="HIGH" if component.fanout > limit * 1.5 else "MEDIUM",
+                reasons=[f"{component_name} fan-out is {component.fanout} (budget: {limit})"],
+                suggestion="Reduce outward dependencies or split the component into smaller slices.",
+                component=component_name,
+            ))
+
+        size_budget = self.config.budgets.get('max_files_per_component') or {}
+        for component_name, component in self.components.items():
+            limit = self._resolve_named_budget(size_budget, component_name)
+            if limit is None or component.file_count <= limit:
+                continue
+            self.architecture_smells.append(Smell(
+                smell="Component Size Budget Exceeded",
+                severity="HIGH" if component.file_count > limit * 1.5 else "MEDIUM",
+                reasons=[f"{component_name} contains {component.file_count} files (budget: {limit})"],
+                suggestion="Split the component by feature or responsibility before it turns into a monolith.",
+                component=component_name,
+            ))
+
+        file_budget = self.config.budgets.get('max_loc_per_file') or {}
+        for fi in self.files:
+            limit = self._resolve_path_budget(file_budget, fi.project_rel_path)
+            if limit is None or fi.loc <= limit:
+                continue
+            self.architecture_smells.append(Smell(
+                smell="File Size Budget Exceeded",
+                severity="HIGH" if fi.loc > limit * 1.5 else "MEDIUM",
+                reasons=[f"{fi.project_rel_path} has {fi.loc} LOC (budget: {limit})"],
+                suggestion="Break this file into smaller collaborators or widgets so the module stays navigable.",
+                component=fi.component,
+                file=fi.project_rel_path,
+            ))
+
+    def _append_cycle_smells(self, graph: Dict[str, Set[str]], smell_name: str,
+                             severity: str, suggestion: str):
+        for cycle_nodes in self._find_cycles(graph):
+            label = ', '.join(cycle_nodes)
+            self.architecture_smells.append(Smell(
+                smell=smell_name,
+                severity=severity,
+                reasons=[f"Cycle detected among: {label}"],
+                suggestion=suggestion,
+                component=cycle_nodes[0],
+                file=cycle_nodes[0],
+            ))
+
+    def _find_cycles(self, graph: Dict[str, Set[str]]) -> List[List[str]]:
+        index = 0
+        stack: List[str] = []
+        indices: Dict[str, int] = {}
+        lowlinks: Dict[str, int] = {}
+        on_stack: Set[str] = set()
+        components: List[List[str]] = []
+
+        def strongconnect(node: str):
+            nonlocal index
+            indices[node] = index
+            lowlinks[node] = index
+            index += 1
+            stack.append(node)
+            on_stack.add(node)
+
+            for neighbor in graph.get(node, set()):
+                if neighbor not in indices:
+                    strongconnect(neighbor)
+                    lowlinks[node] = min(lowlinks[node], lowlinks[neighbor])
+                elif neighbor in on_stack:
+                    lowlinks[node] = min(lowlinks[node], indices[neighbor])
+
+            if lowlinks[node] == indices[node]:
+                scc = []
+                while stack:
+                    item = stack.pop()
+                    on_stack.remove(item)
+                    scc.append(item)
+                    if item == node:
+                        break
+                components.append(sorted(scc))
+
+        for node in graph:
+            if node not in indices:
+                strongconnect(node)
+
+        cycles = []
+        for group in components:
+            if len(group) > 1:
+                cycles.append(group)
+                continue
+            node = group[0]
+            if node in graph.get(node, set()):
+                cycles.append(group)
+        return cycles
+
+    def _find_matching_waiver(self, rule_names: List[str], from_path: str,
+                              to_path: str) -> Optional[Waiver]:
+        for rule_name in rule_names:
+            waiver = self.config.find_waiver(rule_name, from_path, to_path)
+            if waiver:
+                return waiver
+        return None
+
+    def _record_waiver(self, waiver: Waiver, from_path: str, to_path: str):
+        self.applied_waivers.append({
+            'rule': waiver.rule,
+            'from': from_path,
+            'to': to_path,
+            'reason': waiver.reason,
+            'priority': waiver.priority,
+        })
+
+    def _resolve_named_budget(self, budget_map: Dict[str, int], name: str) -> Optional[int]:
+        if name in budget_map:
+            return budget_map[name]
+        best_match = None
+        best_len = -1
+        for pattern, value in budget_map.items():
+            if pattern == 'default':
+                continue
+            if match_name_pattern(name, pattern) and len(pattern) > best_len:
+                best_match = value
+                best_len = len(pattern)
+        if best_match is not None:
+            return best_match
+        return budget_map.get('default')
+
+    def _resolve_path_budget(self, budget_map: Dict[str, int], path: str) -> Optional[int]:
+        if path in budget_map:
+            return budget_map[path]
+        best_match = None
+        best_len = -1
+        for pattern, value in budget_map.items():
+            if pattern == 'default':
+                continue
+            if match_path_pattern(path, pattern) and len(pattern) > best_len:
+                best_match = value
+                best_len = len(pattern)
+        if best_match is not None:
+            return best_match
+        return budget_map.get('default')
+
+    def _config_section(self, root: Dict[str, Any], key: str) -> Dict[str, Any]:
+        value = root.get(key) if isinstance(root, dict) else {}
+        return value if isinstance(value, dict) else {}
+
+    def _as_int(self, value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _is_widget_class(self, ci: ClassInfo) -> bool:
+        return ci.extends in self.WIDGET_BASES or any(b in self.WIDGET_BASES for b in ci.mixins)
+
+    def _number_is_ignored(self, num: float) -> bool:
+        return any(math.isclose(num, candidate, rel_tol=0.0, abs_tol=1e-9)
+                   for candidate in self.magic_number_ignore_common_values)
+
 
 # ─────────────────────────────────────────────
 # SECTION 5: Health Score
@@ -1002,6 +1698,15 @@ def compute_health(smells_arch: List[Smell], smells_design: List[Smell],
         counts["Unstable Dependency"] * 80 +
         counts["Dense Structure"] * 40 +
         counts["Feature Concentration"] * 35 +
+        counts["Dependency Rule Violation"] * 90 +
+        counts["Forbidden Package Dependency"] * 85 +
+        counts["File Rule Violation"] * 70 +
+        counts["File Cycle"] * 90 +
+        counts["Component Cycle"] * 120 +
+        counts["Layer Cycle"] * 140 +
+        counts["Component Fanout Budget Exceeded"] * 30 +
+        counts["Component Size Budget Exceeded"] * 25 +
+        counts["File Size Budget Exceeded"] * 10 +
         counts["Hub-like Modularization"] * 60 +
         counts["Insufficient Modularization"] * 30 +
         counts["Deficient Encapsulation"] * 20 +
@@ -1030,6 +1735,24 @@ def build_recommendations(smells_arch, smells_design, smells_impl) -> List[Dict]
         "Unstable Dependency": ("CRITICAL", "Architecture",
                                 "Stable components depend on unstable ones.",
                                 "Introduce interfaces or inversion of control."),
+        "Dependency Rule Violation": ("CRITICAL", "Architecture",
+                                      "A component depends on a forbidden architectural boundary.",
+                                      "Route the dependency through an allowed contract or port."),
+        "Forbidden Package Dependency": ("CRITICAL", "Architecture",
+                                         "A layer imports an SDK/package owned by another boundary.",
+                                         "Move the SDK usage to the owning layer or wrap it behind an interface."),
+        "Layer Cycle": ("CRITICAL", "Architecture",
+                        "Configured layers now depend on each other cyclically.",
+                        "Restore one-way flow between layers."),
+        "Component Cycle": ("CRITICAL", "Architecture",
+                            "Components depend on each other in a cycle.",
+                            "Break the cycle with interfaces or a new shared abstraction."),
+        "File Cycle": ("HIGH", "Architecture",
+                       "Files import each other cyclically.",
+                       "Extract shared code or invert one side of the dependency."),
+        "File Rule Violation": ("HIGH", "Architecture",
+                                "A configured file-level import constraint was violated.",
+                                "Remove the direct import and use an allowed entrypoint."),
         "God Class": ("HIGH", "Design", "Classes accumulate excessive responsibilities.",
                       "Apply Single Responsibility Principle — split the class."),
         "Dense Structure": ("HIGH", "Architecture", "Component has too many external dependencies.",
@@ -1037,6 +1760,15 @@ def build_recommendations(smells_arch, smells_design, smells_impl) -> List[Dict]
         "Feature Concentration": ("MEDIUM", "Architecture",
                                   "A single component mixes too many architectural concerns.",
                                   "Split the component into focused UI, state, domain, data, or infrastructure slices."),
+        "Component Fanout Budget Exceeded": ("MEDIUM", "Architecture",
+                                             "A component exceeds its allowed outgoing dependency budget.",
+                                             "Reduce fan-out or split the component by responsibility."),
+        "Component Size Budget Exceeded": ("MEDIUM", "Architecture",
+                                           "A component exceeds its file budget.",
+                                           "Split the component before coordination cost keeps growing."),
+        "File Size Budget Exceeded": ("MEDIUM", "Architecture",
+                                      "A file exceeds its configured LOC budget.",
+                                      "Split the file into smaller collaborators or widgets."),
         "Hub-like Modularization": ("HIGH", "Design", "File is both imported by and imports many others.",
                                     "Extract shared logic to a dedicated module."),
         "Complex Method": ("HIGH", "Implementation", "Methods with high cyclomatic complexity.",
@@ -1080,7 +1812,9 @@ def build_recommendations(smells_arch, smells_design, smells_impl) -> List[Dict]
 class JSONReporter:
     def generate(self, files: List[FileInfo], components: Dict[str, ComponentInfo],
                  smells_arch: List[Smell], smells_design: List[Smell],
-                 smells_impl: List[Smell], project_name: str) -> str:
+                 smells_impl: List[Smell], project_name: str,
+                 config_path: Optional[str] = None,
+                 applied_waivers: Optional[List[Dict[str, str]]] = None) -> str:
         health, debt = compute_health(smells_arch, smells_design, smells_impl)
         all_classes = [ci for fi in files for ci in fi.classes]
         all_methods = [mi for fi in files for ci in fi.classes for mi in ci.methods]
@@ -1095,6 +1829,7 @@ class JSONReporter:
                 "analysis_date": datetime.now().isoformat(),
                 "generator": "Darta v1.0",
                 "files_analyzed": len(files),
+                "config_path": config_path,
             },
             "summary_kpis": {
                 "total_files": len(files),
@@ -1111,12 +1846,15 @@ class JSONReporter:
                 "god_components": sum(1 for s in smells_arch if s.smell == "God Component"),
                 "unstable_dependencies": sum(1 for s in smells_arch if s.smell == "Unstable Dependency"),
                 "feature_concentrations": sum(1 for s in smells_arch if s.smell == "Feature Concentration"),
+                "dependency_rule_violations": sum(1 for s in smells_arch if s.smell == "Dependency Rule Violation"),
+                "cycle_violations": sum(1 for s in smells_arch if s.smell in {"File Cycle", "Component Cycle", "Layer Cycle"}),
                 "implementation_smells_total": len(smells_impl),
             },
             "architecture_smells": [
                 {
                     "smell": s.smell,
                     "component": s.component,
+                    "file": s.file,
                     "severity": s.severity,
                     "reasons": s.reasons,
                     "suggestion": s.suggestion,
@@ -1185,6 +1923,8 @@ class JSONReporter:
             ],
             "actionable_recommendations": recs,
         }
+        if applied_waivers:
+            data["applied_waivers"] = applied_waivers
         return json.dumps(data, indent=2)
 
 
@@ -1195,16 +1935,22 @@ class JSONReporter:
 class MarkdownReporter:
     def generate(self, files: List[FileInfo], components: Dict[str, ComponentInfo],
                  smells_arch: List[Smell], smells_design: List[Smell],
-                 smells_impl: List[Smell], project_name: str) -> str:
+                 smells_impl: List[Smell], project_name: str,
+                 config_path: Optional[str] = None,
+                 applied_waivers: Optional[List[Dict[str, str]]] = None) -> str:
         health, debt = compute_health(smells_arch, smells_design, smells_impl)
         all_classes = [ci for fi in files for ci in fi.classes]
         all_methods = [mi for fi in files for ci in fi.classes for mi in ci.methods]
         avg_cc = (sum(m.cc for m in all_methods) / len(all_methods)) if all_methods else 0.0
         recs = build_recommendations(smells_arch, smells_design, smells_impl)
 
+        subtitle = f"_Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Darta v1.0_"
+        if config_path:
+            subtitle = subtitle[:-1] + f" | Config: `{os.path.basename(config_path)}`_"
+
         lines = [
             f"# Darta Report — {project_name}",
-            f"_Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Darta v1.0_",
+            subtitle,
             "",
             "## Health Score",
             f"**{health}/100** (Technical Debt: {debt})",
@@ -1222,7 +1968,8 @@ class MarkdownReporter:
         if smells_arch:
             lines += ["## Architecture Smells", ""]
             for s in smells_arch:
-                lines.append(f"### [{s.severity}] {s.smell} — `{s.component}`")
+                target = s.component or s.file or "project"
+                lines.append(f"### [{s.severity}] {s.smell} — `{target}`")
                 for r in s.reasons:
                     lines.append(f"- {r}")
                 lines.append(f"> **Suggestion:** {s.suggestion}")
@@ -1244,6 +1991,15 @@ class MarkdownReporter:
                 lines.append(f"- **[{s.severity}] {s.smell}** in `{s.file}`{loc}: {'; '.join(s.reasons)}")
             if len(smells_impl) > 50:
                 lines.append(f"_...and {len(smells_impl) - 50} more._")
+            lines.append("")
+
+        if applied_waivers:
+            lines += ["## Applied Waivers", ""]
+            for waiver in applied_waivers:
+                reason = f": {waiver['reason']}" if waiver.get('reason') else ""
+                lines.append(
+                    f"- `{waiver['rule']}` waived for `{waiver['from']}` -> `{waiver['to']}`{reason}"
+                )
             lines.append("")
 
         if recs:
@@ -1279,13 +2035,16 @@ class HTMLReporter:
 
     def generate(self, files: List[FileInfo], components: Dict[str, ComponentInfo],
                  smells_arch: List[Smell], smells_design: List[Smell],
-                 smells_impl: List[Smell], project_name: str) -> str:
+                 smells_impl: List[Smell], project_name: str,
+                 config_path: Optional[str] = None,
+                 applied_waivers: Optional[List[Dict[str, str]]] = None) -> str:
         health, debt = compute_health(smells_arch, smells_design, smells_impl)
         all_classes = [ci for fi in files for ci in fi.classes]
         all_methods = [mi for fi in files for ci in fi.classes for mi in ci.methods]
         avg_cc = (sum(m.cc for m in all_methods) / len(all_methods)) if all_methods else 0.0
         avg_wmc = (sum(c.wmc for c in all_classes) / len(all_classes)) if all_classes else 0.0
         recs = build_recommendations(smells_arch, smells_design, smells_impl)
+        config_label = f" &nbsp;|&nbsp; config: {os.path.basename(config_path)}" if config_path else ""
 
         if health >= 80:
             health_color = "#22c55e"
@@ -1357,7 +2116,7 @@ class HTMLReporter:
   <div class="inner">
     <div>
       <h1>&#127775; Darta Report</h1>
-      <div class="subtitle">Project: <strong>{project_name}</strong> &nbsp;|&nbsp; {datetime.now().strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; {len(files)} files analyzed</div>
+      <div class="subtitle">Project: <strong>{project_name}</strong> &nbsp;|&nbsp; {datetime.now().strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; {len(files)} files analyzed{config_label}</div>
     </div>
     <div class="health-badge">
       <div class="score">{health}</div>
@@ -1379,6 +2138,7 @@ class HTMLReporter:
             ("Arch Smells", len(smells_arch)),
             ("Design Smells", len(smells_design)),
             ("Impl Smells", len(smells_impl)),
+            ("Waivers", len(applied_waivers or [])),
             ("Tech Debt", int(debt)),
         ]
         for label, val in kpis:
@@ -1405,7 +2165,8 @@ class HTMLReporter:
         if smells_arch:
             html += '<button class="toggle-all" onclick="toggleSection(\'arch\')">Expand All</button>\n'
             for i, s in enumerate(smells_arch):
-                html += self._smell_card(s, f"arch{i}", label=f"Component: {s.component}")
+                label = s.component or s.file or "Project"
+                html += self._smell_card(s, f"arch{i}", label=label)
         else:
             html += '<p style="color:#22c55e;padding:1rem 0;">&#10003; No architecture smells detected.</p>\n'
 
@@ -1430,6 +2191,21 @@ class HTMLReporter:
                 html += self._smell_card(s, f"impl{i}", label=meta)
         else:
             html += '<p style="color:#22c55e;padding:1rem 0;">&#10003; No implementation smells detected.</p>\n'
+
+        if applied_waivers:
+            html += f'<h2>Applied Waivers <span class="section-count">{len(applied_waivers)}</span></h2>\n'
+            for waiver in applied_waivers:
+                reason = waiver.get('reason') or 'No reason provided.'
+                html += f"""<div class="rec-card">
+  <div class="rec-row">
+    <span class="rec-priority p-MEDIUM">WAIVER</span>
+    <div class="rec-text">
+      <div class="rec-issue">{waiver['from']} &rarr; {waiver['to']}</div>
+      <div class="rec-action">{reason}</div>
+    </div>
+    <span class="count-chip">{waiver['rule']}</span>
+  </div>
+</div>\n"""
 
         # Components table
         html += '<h2>&#128193; Components</h2>\n'
@@ -1498,15 +2274,25 @@ document.querySelectorAll('.smell-header').forEach(h => {{
 # SECTION 10: Main Orchestration
 # ─────────────────────────────────────────────
 
-def walk_dart_files(lib_root: str) -> List[str]:
+def walk_dart_files(lib_root: str, project_root: Optional[str] = None,
+                    ignore_patterns: Optional[List[str]] = None) -> List[str]:
     """Recursively collect all .dart files under lib_root."""
+    project_root = project_root or os.path.dirname(lib_root)
+    ignore_patterns = ignore_patterns or []
     result = []
     for root, dirs, fnames in os.walk(lib_root):
         # Skip hidden dirs and common generated dirs
         dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('generated', '.dart_tool')]
         for fn in fnames:
             if fn.endswith('.dart'):
-                result.append(os.path.join(root, fn))
+                path = os.path.join(root, fn)
+                project_rel = normalize_path(os.path.relpath(path, project_root))
+                lib_rel = normalize_path(os.path.relpath(path, lib_root))
+                if any(match_path_pattern(project_rel, pattern) for pattern in ignore_patterns):
+                    continue
+                if any(match_path_pattern(lib_rel, pattern) for pattern in ignore_patterns):
+                    continue
+                result.append(path)
     return sorted(result)
 
 
@@ -1525,11 +2311,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Darta v1.0 — Dart/Flutter Architecture Analyzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Examples:\n  python darta.py\n  python darta.py --path ~/myapp --format json\n  python darta.py --component-depth 2 --format md --output stdout"
+        epilog="Examples:\n  python darta.py\n  python darta.py --path ~/myapp --format json\n  python darta.py --component-depth 2 --format md --output stdout\n  python darta.py --config ~/myapp/darta.yaml"
     )
     parser.add_argument('--path', default='.', help='Path to Flutter/Dart project (default: current dir)')
     parser.add_argument('--format', choices=['html', 'json', 'md'], default='html', help='Output format')
     parser.add_argument('--output', default='file', help='"stdout" or a file path. Default: saves DARTA_REPORT.<ext>')
+    parser.add_argument('--config', default=None, help='Path to darta.yaml. Default: auto-discover in project root')
     parser.add_argument(
         '--component-depth',
         type=int,
@@ -1538,21 +2325,33 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.component_depth is not None and args.component_depth < 1:
-        parser.error('--component-depth must be a positive integer')
-
-    project_path = os.path.abspath(args.path)
-    project_name = os.path.basename(project_path)
-
-    print(f"Darta v1.0 — Analyzing {project_name}", file=sys.stderr)
-
-    lib_root = find_lib_root(project_path)
+    input_path = os.path.abspath(args.path)
+    lib_root = find_lib_root(input_path)
     if not lib_root:
-        print(f"ERROR: No lib/ directory found in {project_path}", file=sys.stderr)
+        print(f"ERROR: No lib/ directory found in {input_path}", file=sys.stderr)
         sys.exit(1)
 
+    project_root = input_path if os.path.basename(input_path) != 'lib' else os.path.dirname(lib_root)
+    config = load_darta_config(project_root, args.config)
+    component_depth = args.component_depth
+    if component_depth is None and config:
+        component_depth = config.component_depth
+
+    if component_depth is not None and component_depth < 1:
+        parser.error('--component-depth must be a positive integer')
+
+    project_name = (config.project_name if config and config.project_name else os.path.basename(project_root))
+
+    print(f"Darta v1.0 — Analyzing {project_name}", file=sys.stderr)
+    if config:
+        print(f"  Loaded config: {config.path}", file=sys.stderr)
+
     print(f"  Scanning {lib_root} ...", file=sys.stderr)
-    dart_files = walk_dart_files(lib_root)
+    dart_files = walk_dart_files(
+        lib_root,
+        project_root=project_root,
+        ignore_patterns=(config.ignore_paths if config else None),
+    )
     if not dart_files:
         print("ERROR: No .dart files found.", file=sys.stderr)
         sys.exit(1)
@@ -1560,7 +2359,11 @@ def main():
 
     # Parse
     print("  Parsing files...", file=sys.stderr)
-    dart_parser = DartParser(component_depth=args.component_depth)
+    dart_parser = DartParser(
+        component_depth=component_depth,
+        project_root=project_root,
+        config=config,
+    )
     files: List[FileInfo] = []
     for path in dart_files:
         fi = dart_parser.parse_file(path, lib_root)
@@ -1577,7 +2380,7 @@ def main():
 
     # Smell detection
     print("  Detecting smells...", file=sys.stderr)
-    detector = SmellDetector(files, components)
+    detector = SmellDetector(files, components, mc.file_dependencies, config=config)
     detector.detect_all()
 
     print(f"  Architecture smells: {len(detector.architecture_smells)}", file=sys.stderr)
@@ -1589,17 +2392,23 @@ def main():
     if args.format == 'json':
         reporter = JSONReporter()
         content = reporter.generate(files, components, detector.architecture_smells,
-                                    detector.design_smells, detector.implementation_smells, project_name)
+                                    detector.design_smells, detector.implementation_smells, project_name,
+                                    config_path=(config.path if config else None),
+                                    applied_waivers=detector.applied_waivers)
         ext = 'json'
     elif args.format == 'md':
         reporter = MarkdownReporter()
         content = reporter.generate(files, components, detector.architecture_smells,
-                                    detector.design_smells, detector.implementation_smells, project_name)
+                                    detector.design_smells, detector.implementation_smells, project_name,
+                                    config_path=(config.path if config else None),
+                                    applied_waivers=detector.applied_waivers)
         ext = 'md'
     else:
         reporter = HTMLReporter()
         content = reporter.generate(files, components, detector.architecture_smells,
-                                    detector.design_smells, detector.implementation_smells, project_name)
+                                    detector.design_smells, detector.implementation_smells, project_name,
+                                    config_path=(config.path if config else None),
+                                    applied_waivers=detector.applied_waivers)
         ext = 'html'
 
     # Output
@@ -1607,7 +2416,7 @@ def main():
         sys.stdout.write(content)
     else:
         if args.output == 'file':
-            out_path = os.path.join(project_path, f"DARTA_REPORT.{ext}")
+            out_path = os.path.join(project_root, f"DARTA_REPORT.{ext}")
         else:
             out_path = args.output
         with open(out_path, 'w', encoding='utf-8') as f:
