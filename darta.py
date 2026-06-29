@@ -682,7 +682,7 @@ class DartParser:
 
                 body = lines[start_line:end_line + 1]
                 ci.methods = self._parse_methods(body, start_line)
-                ci.fields = self._parse_fields(body, start_line)
+                ci.fields = self._parse_fields(body, start_line, ci.methods)
                 classes.append(ci)
                 i = end_line + 1
             else:
@@ -774,12 +774,26 @@ class DartParser:
             result.append(p)
         return result
 
-    def _parse_fields(self, body: List[str], offset: int) -> List[FieldInfo]:
+    def _parse_fields(self, body: List[str], offset: int, methods: List[MethodInfo]) -> List[FieldInfo]:
         """Extract field declarations from a class body."""
         fields = []
         for i, ln in enumerate(body[1:], 1):
+            line_no = offset + i
+            # Skip lines that are inside method blocks
+            in_method = False
+            for m in methods:
+                if m.start_line <= line_no <= m.end_line:
+                    in_method = True
+                    break
+            if in_method:
+                continue
+
             # Skip lines that look like method signatures
             if re.search(r'\(', ln) and re.search(r'\)\s*[{;=>]', ln):
+                continue
+            # Skip control flow statements to avoid false positives inside methods
+            words = ln.strip().split()
+            if words and words[0] in ('return', 'case', 'default', 'if', 'for', 'while', 'switch'):
                 continue
             m = self.FIELD_RE.match(ln)
             if m:
@@ -790,7 +804,7 @@ class DartParser:
                     name=name,
                     type_name='',
                     is_public=not name.startswith('_'),
-                    line=offset + i,
+                    line=line_no,
                 ))
         return fields
 
@@ -1212,11 +1226,21 @@ class SmellDetector:
             ))
 
     def _check_deficient_encapsulation(self, ci: ClassInfo, fi: FileInfo):
-        if ci.nopf > 5:
+        # Skip Flutter widgets as they are immutable and must define constructor properties
+        if ci.extends in ('StatefulWidget', 'StatelessWidget', 'Widget'):
+            return
+            
+        threshold = 10  # default threshold
+        if self.config and self.config.smell_settings:
+            design_settings = self.config.smell_settings.get('design', {})
+            encap_settings = design_settings.get('deficient_encapsulation', {})
+            threshold = encap_settings.get('max_public_fields', 10)
+
+        if ci.nopf > threshold:
             self.design_smells.append(Smell(
                 smell="Deficient Encapsulation",
                 severity="MEDIUM",
-                reasons=[f"{ci.nopf} public fields > 5"],
+                reasons=[f"{ci.nopf} public fields > {threshold}"],
                 suggestion="Make fields private and expose via getters/setters.",
                 file=fi.rel_path,
                 class_name=ci.name,
